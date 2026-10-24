@@ -5,7 +5,9 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
+import hashlib
 import hmac
+import json
 import os
 import secrets
 import time
@@ -29,12 +31,74 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 SESSION_COOKIE_SECURE = os.getenv(
     "SESSION_COOKIE_SECURE", "true"
 ).strip().lower() not in {"false", "no", "0"}
+TEACHER_CREDENTIALS_FILE = Path(
+    os.getenv("TEACHER_CREDENTIALS_FILE")
+    or current_dir / "teachers.json"
+)
+PASSWORD_HASH_MIN_ITERATIONS = 100_000
+PASSWORD_HASH_MAX_ITERATIONS = 2_000_000
 teacher_sessions: dict[str, tuple[str, float]] = {}
 
 
 class TeacherCredentials(BaseModel):
     username: str
     password: str
+
+
+def load_teacher_credentials() -> list[dict[str, str]]:
+    try:
+        credentials = json.loads(
+            TEACHER_CREDENTIALS_FILE.read_text(encoding="utf-8")
+        )
+    except FileNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Teacher credentials file is not configured",
+        ) from error
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Teacher credentials file could not be read",
+        ) from error
+
+    teachers = credentials.get("teachers") if isinstance(credentials, dict) else None
+    if not isinstance(teachers, list) or any(
+        not isinstance(teacher, dict)
+        or not isinstance(teacher.get("username"), str)
+        or not isinstance(teacher.get("password_hash"), str)
+        for teacher in teachers
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Teacher credentials file has an invalid format",
+        )
+    return teachers
+
+
+def verify_teacher_password(password: str, encoded_hash: str) -> bool:
+    algorithm, separator, remainder = encoded_hash.partition("$")
+    if not separator or algorithm != "pbkdf2_sha256":
+        return False
+
+    try:
+        iterations_text, salt_hex, expected_hex = remainder.split("$")
+        iterations = int(iterations_text)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(expected_hex)
+    except ValueError:
+        return False
+
+    if not (
+        PASSWORD_HASH_MIN_ITERATIONS
+        <= iterations
+        <= PASSWORD_HASH_MAX_ITERATIONS
+    ) or len(salt) < 16 or len(expected) != 32:
+        return False
+
+    actual = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, iterations
+    )
+    return hmac.compare_digest(actual, expected)
 
 
 def get_teacher_username(request: Request) -> str | None:
@@ -140,21 +204,17 @@ def get_auth_status(request: Request):
 
 @app.post("/auth/login")
 def login(credentials: TeacherCredentials, response: Response):
-    configured_username = os.getenv("TEACHER_USERNAME")
-    configured_password = os.getenv("TEACHER_PASSWORD")
-    if not configured_username or not configured_password:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Teacher login is not configured",
-        )
-
-    username_matches = hmac.compare_digest(
-        credentials.username, configured_username
+    teacher = next(
+        (
+            entry
+            for entry in load_teacher_credentials()
+            if hmac.compare_digest(credentials.username, entry["username"])
+        ),
+        None,
     )
-    password_matches = hmac.compare_digest(
-        credentials.password, configured_password
-    )
-    if not (username_matches and password_matches):
+    if teacher is None or not verify_teacher_password(
+        credentials.password, teacher["password_hash"]
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid username or password",
@@ -162,7 +222,7 @@ def login(credentials: TeacherCredentials, response: Response):
 
     token = secrets.token_urlsafe(32)
     teacher_sessions[token] = (
-        configured_username,
+        teacher["username"],
         time.time() + SESSION_TTL_SECONDS,
     )
     response.set_cookie(
@@ -174,7 +234,7 @@ def login(credentials: TeacherCredentials, response: Response):
         samesite="strict",
         path="/",
     )
-    return {"authenticated": True, "username": configured_username}
+    return {"authenticated": True, "username": teacher["username"]}
 
 
 @app.post("/auth/logout")

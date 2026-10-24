@@ -16,18 +16,42 @@ A super simple FastAPI application that allows students to view and sign up for 
    pip install fastapi uvicorn
    ```
 
-2. Run the application:
+2. Create a private teacher credentials file from the example:
 
    ```
-   TEACHER_USERNAME=teacher TEACHER_PASSWORD='choose-a-strong-password' \
-     uvicorn src.app:app --reload
+   cp src/teachers.example.json src/teachers.json
+   ```
+
+   Generate a password hash for each assigned teacher password:
+
+   ```python
+   import getpass
+   import hashlib
+   import secrets
+
+   iterations = 600_000
+   salt = secrets.token_bytes(16)
+   password = getpass.getpass("Teacher password: ").encode("utf-8")
+   digest = hashlib.pbkdf2_hmac("sha256", password, salt, iterations)
+   print(f"pbkdf2_sha256${iterations}${salt.hex()}${digest.hex()}")
+   ```
+
+   Add each username and generated hash to the `teachers` array in
+   `src/teachers.json`, using `password_hash` for the hash field. This private
+   file is ignored by Git. Never commit teacher passwords or hashes. The
+   backend also accepts an alternate file path through
+   `TEACHER_CREDENTIALS_FILE`.
+
+3. Run the application:
+
+   ```
+   uvicorn src.app:app --reload
    ```
 
    Set `SESSION_COOKIE_SECURE=false` only when accessing the app over plain HTTP
-   during local development. The default requires HTTPS. Configure the teacher
-   credentials as environment secrets; do not commit them to the repository.
+   during local development. The default requires HTTPS.
 
-3. Open your browser and go to:
+4. Open your browser and go to:
    - API documentation: http://localhost:8000/docs
    - Alternative documentation: http://localhost:8000/redoc
 
